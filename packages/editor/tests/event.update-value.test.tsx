@@ -1,6 +1,11 @@
 import {createTestKeyGenerator} from '@portabletext/test'
 import {describe, expect, test, vi} from 'vitest'
-import {defineSchema, type EditorEmittedEvent} from '../src'
+import {
+  defineSchema,
+  type EditorEmittedEvent,
+  type MutationEvent,
+  type Patch,
+} from '../src'
 import {EventListenerPlugin} from '../src/plugins/plugin.event-listener'
 import {createTestEditor} from '../src/test/vitest'
 import {toTextspec} from '../test-utils/to-textspec'
@@ -1910,5 +1915,158 @@ describe('event.update value: adjacent same-mark spans', () => {
         },
       ])
     })
+  })
+})
+
+describe('event.update value: auto-resolved invalid blocks', () => {
+  // Regression: `validateValue` auto-resolutions (e.g. minting a missing
+  // child `_key`) were emitted as outbound patches while the *raw* block
+  // proceeded into the engine. The engine ended up holding the un-repaired
+  // shape (a keyless child), diverging from the document that received the
+  // minted key, and the next sync against that invalid engine state killed
+  // the sync silently.
+  const keylessChildBlock = {
+    _key: 'b0',
+    _type: 'block',
+    children: [{_type: 'span', text: 'hello changed', marks: []}],
+    markDefs: [],
+    style: 'normal',
+  }
+
+  test('Scenario: a mid-session update with a keyless child is repaired once and the sync survives', async () => {
+    const patches: Array<Patch> = []
+    const {editor} = await createTestEditor({
+      keyGenerator: createTestKeyGenerator(),
+      schemaDefinition: defineSchema({}),
+      initialValue: [
+        {
+          _key: 'b0',
+          _type: 'block',
+          children: [{_key: 's0', _type: 'span', text: 'hello', marks: []}],
+          markDefs: [],
+          style: 'normal',
+        },
+      ],
+      children: (
+        <EventListenerPlugin
+          on={(event) => {
+            if (event.type === 'patch') {
+              patches.push(event.patch)
+            }
+          }}
+        />
+      ),
+    })
+
+    // A changed block arrives whose span lost its `_key`.
+    editor.send({type: 'update value', value: [keylessChildBlock]})
+
+    // The auto-resolution is emitted as a patch AND applied to the block
+    // the engine receives: one key, minted once, on both sides.
+    await vi.waitFor(() => {
+      expect(patches).toEqual([
+        {
+          type: 'set',
+          path: [{_key: 'b0'}, 'children', 0],
+          value: {
+            _type: 'span',
+            _key: 'k2',
+            text: 'hello changed',
+            marks: [],
+          },
+        },
+      ])
+      expect(editor.getSnapshot().context.value).toEqual([
+        {
+          _key: 'b0',
+          _type: 'block',
+          children: [
+            {_key: 'k2', _type: 'span', text: 'hello changed', marks: []},
+          ],
+          markDefs: [],
+          style: 'normal',
+        },
+      ])
+    })
+
+    // The sync is still alive: a later update still lands.
+    editor.send({
+      type: 'update value',
+      value: [
+        {
+          _key: 'b0',
+          _type: 'block',
+          children: [{_key: 's9', _type: 'span', text: 'recovered', marks: []}],
+          markDefs: [],
+          style: 'normal',
+        },
+      ],
+    })
+
+    await vi.waitFor(
+      () => {
+        expect(editor.getSnapshot().context.value).toEqual([
+          {
+            _key: 'b0',
+            _type: 'block',
+            children: [
+              {_key: 's9', _type: 'span', text: 'recovered', marks: []},
+            ],
+            markDefs: [],
+            style: 'normal',
+          },
+        ])
+      },
+      // The sync machine parks in `busy` while its own emitted mutation
+      // flushes and re-checks on a 1s timer, so the recovery value can
+      // take a beat over a second to land.
+      {timeout: 5000},
+    )
+  })
+
+  test('Scenario: a startup value with a keyless child is repaired in the engine without emitting patches', async () => {
+    const patches: Array<Patch> = []
+    const mutations: Array<MutationEvent> = []
+    const {editor} = await createTestEditor({
+      keyGenerator: createTestKeyGenerator(),
+      schemaDefinition: defineSchema({}),
+      initialValue: [
+        {
+          _key: 'b0',
+          _type: 'block',
+          children: [{_type: 'span', text: 'hello', marks: []}],
+          markDefs: [],
+          style: 'normal',
+        },
+      ],
+      children: (
+        <EventListenerPlugin
+          on={(event) => {
+            if (event.type === 'patch') {
+              patches.push(event.patch)
+            }
+            if (event.type === 'mutation') {
+              mutations.push(event)
+            }
+          }}
+        />
+      ),
+    })
+
+    await vi.waitFor(() => {
+      expect(editor.getSnapshot().context.value).toEqual([
+        {
+          _key: 'b0',
+          _type: 'block',
+          children: [{_key: 'k2', _type: 'span', text: 'hello', marks: []}],
+          markDefs: [],
+          style: 'normal',
+        },
+      ])
+    })
+
+    // No mutation leaves a pristine editor on open.
+    expect(patches).toEqual([])
+    expect(mutations).toEqual([])
   })
 })

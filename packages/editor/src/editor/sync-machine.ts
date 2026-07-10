@@ -1,4 +1,4 @@
-import type {Patch} from '@portabletext/patches'
+import {applyAll, type Patch} from '@portabletext/patches'
 import {isSpan, isTextBlock, type PortableTextBlock} from '@portabletext/schema'
 import type {ActorRefFrom} from 'xstate'
 import {
@@ -703,7 +703,13 @@ function syncBlock({
     )
 
     if (validation.valid || validation.resolution?.autoResolve) {
-      const engineBlock = toEngineBlock(block, {
+      // Apply the auto-resolution to the block the engine receives, so the
+      // engine never holds the un-repaired shape.
+      const repairedBlock =
+        !validation.valid && validation.resolution?.autoResolve
+          ? (applyAll([block], validation.resolution.patches).at(0) ?? block)
+          : block
+      const engineBlock = toEngineBlock(repairedBlock, {
         schemaTypes: context.schema,
       })
 
@@ -785,8 +791,20 @@ function syncBlock({
   }
 
   if (validation.valid || validation.resolution?.autoResolve) {
+    // Apply the auto-resolution to the block the engine receives. Without
+    // this the repair only exists as the emitted patches above while the
+    // raw block proceeds into the engine: the engine ends up holding the
+    // un-repaired shape (e.g. a keyless child), diverging from the document
+    // that received the minted key, and the next sync against that invalid
+    // engine state can kill the sync.
+    const repairedBlock =
+      !validation.valid && validation.resolution?.autoResolve
+        ? (applyAll(validationValue, validation.resolution.patches).at(0) ??
+          block)
+        : block
+
     if (oldBlock._key === block._key && oldBlock._type === block._type) {
-      debug.syncValue('Updating block', oldBlock, block)
+      debug.syncValue('Updating block', oldBlock, repairedBlock)
 
       withoutNormalizing(editorEngine, () => {
         withRemoteChanges(editorEngine, () => {
@@ -795,14 +813,14 @@ function syncBlock({
               context,
               editorEngine,
               oldEngineBlock,
-              block,
+              block: repairedBlock,
               index,
             })
           })
         })
       })
     } else {
-      debug.syncValue('Replacing block', oldBlock, block)
+      debug.syncValue('Replacing block', oldBlock, repairedBlock)
 
       withoutNormalizing(editorEngine, () => {
         withRemoteChanges(editorEngine, () => {
@@ -810,7 +828,7 @@ function syncBlock({
             replaceBlock({
               context,
               editorEngine,
-              block,
+              block: repairedBlock,
               index,
             })
           })
